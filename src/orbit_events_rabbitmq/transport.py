@@ -26,6 +26,7 @@ from uuid import UUID, uuid4
 
 import aio_pika
 from orbit.events import Event, EventHandler, EventTransport
+from orbit_events import decode_event, encode_cloudevent
 
 from orbit_events_rabbitmq.config import RabbitMQConfig
 
@@ -136,6 +137,8 @@ class _Subscription:
     channel: _Channel
     queue: _Queue
     consumer_tag: str
+    consumer_cancelled: bool = False
+    channel_closed: bool = False
 
 
 class RabbitMQEventTransport(EventTransport):
@@ -207,6 +210,10 @@ class RabbitMQEventTransport(EventTransport):
                     raise RabbitMQTransportError("connect") from None
             return self._connection
 
+    async def check_connection(self) -> None:
+        """Establish the configured AMQP connection without declaring or publishing anything."""
+        await self._ensure_connection()
+
     async def _ensure_publisher(self) -> tuple[_Channel, _Exchange]:
         """Open one confirmed publisher channel and declare its durable topic exchange."""
         async with self._publisher_lock:
@@ -243,13 +250,11 @@ class RabbitMQEventTransport(EventTransport):
         if self._closed:
             raise RabbitMQTransportError("publish")
         routing_key = self.routing_key_for(event.name)
-        body = event.model_dump_json().encode("utf-8")
-        if len(body) > self.config.max_message_bytes:
-            raise ValueError("Encoded event exceeds RabbitMQConfig.max_message_bytes.")
+        body = encode_cloudevent(event, max_bytes=self.config.max_message_bytes)
         _channel, exchange = await self._ensure_publisher()
         message = self._message_factory(
             body,
-            content_type="application/json",
+            content_type="application/cloudevents+json",
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
         )
         async with self._publish_lock:
@@ -316,7 +321,7 @@ class RabbitMQEventTransport(EventTransport):
     ) -> None:
         """Validate, retry, then ack or reject one delivery without exposing payload contents."""
         try:
-            event = Event[Any].model_validate_json(message.body)
+            event = decode_event(message.body, max_bytes=self.config.max_message_bytes)
             if event.name != event_name:
                 raise ValueError("Event envelope name does not match its RabbitMQ routing key.")
         except Exception as exc:
@@ -346,23 +351,26 @@ class RabbitMQEventTransport(EventTransport):
         """Cancel a queue consumer and close its channel, rejecting unknown tokens."""
         if not isinstance(token, UUID):
             raise TypeError("RabbitMQ subscription token must be a UUID.")
-        async with self._state_lock:
-            subscription = self._subscriptions.pop(token, None)
-            if subscription is None:
-                raise ValueError("Unknown RabbitMQ subscription token.")
-            self._event_tokens.pop(subscription.event_name, None)
-        try:
-            await subscription.queue.cancel(subscription.consumer_tag)
-            await subscription.channel.close()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            raise RabbitMQTransportError("unsubscribe") from None
+        async with self._close_lock:
+            async with self._state_lock:
+                if self._closed:
+                    raise RabbitMQTransportError("unsubscribe")
+                subscription = self._subscriptions.get(token)
+                if subscription is None:
+                    raise ValueError("Unknown RabbitMQ subscription token.")
+            await self._close_subscription(subscription, operation="unsubscribe")
+            async with self._state_lock:
+                if self._subscriptions.get(token) is subscription:
+                    self._subscriptions.pop(token)
+                    self._event_tokens.pop(subscription.event_name, None)
 
     async def close(self) -> None:
         """Cancel consumers and drain one shared cleanup before propagating cancellation."""
         task = self._close_task
-        if task is None:
+        retry_failed_close = (
+            task is not None and task.done() and (task.cancelled() or task.exception() is not None)
+        )
+        if task is None or retry_failed_close:
             self._closed = True
             task = asyncio.create_task(self._finish_close())
             self._close_task = task
@@ -380,36 +388,67 @@ class RabbitMQEventTransport(EventTransport):
 
     async def _finish_close(self) -> None:
         """Stop consumers and close all owned AMQP resources, attempting every cleanup step."""
-        async with self._state_lock:
-            subscriptions = tuple(self._subscriptions.values())
-            self._subscriptions.clear()
-            self._event_tokens.clear()
-        failures = 0
-        for subscription in subscriptions:
+        async with self._close_lock:
+            async with self._state_lock:
+                subscriptions = tuple(self._subscriptions.items())
+            failures = 0
+            for token, subscription in subscriptions:
+                try:
+                    await self._close_subscription(subscription, operation="close")
+                except Exception:
+                    failures += 1
+                    continue
+                async with self._state_lock:
+                    if self._subscriptions.get(token) is subscription:
+                        self._subscriptions.pop(token, None)
+                        self._event_tokens.pop(subscription.event_name, None)
+
+            async with self._publish_lock, self._publisher_lock:
+                if self._publisher_channel is not None:
+                    try:
+                        await self._publisher_channel.close()
+                    except Exception:
+                        failures += 1
+                    else:
+                        self._publisher_channel = None
+                        self._exchange = None
+                if self._connection is not None:
+                    try:
+                        await self._connection.close()
+                    except Exception:
+                        failures += 1
+                    else:
+                        self._connection = None
+                        self._publisher_channel = None
+                        self._exchange = None
+                        async with self._state_lock:
+                            # Closing the owning connection also releases consumer channels.
+                            self._subscriptions.clear()
+                            self._event_tokens.clear()
+            if failures:
+                raise RabbitMQTransportError("close") from None
+
+    async def _close_subscription(self, subscription: _Subscription, *, operation: str) -> None:
+        """Release a subscription while retaining retry state for each owned resource."""
+        if not subscription.consumer_cancelled:
             try:
                 await subscription.queue.cancel(subscription.consumer_tag)
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                failures += 1
+                # Closing the channel below still terminates this queue consumer.
+                pass
+            else:
+                subscription.consumer_cancelled = True
+        if not subscription.channel_closed:
             try:
                 await subscription.channel.close()
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                failures += 1
-        async with self._publish_lock, self._publisher_lock:
-            if self._publisher_channel is not None:
-                try:
-                    await self._publisher_channel.close()
-                except Exception:
-                    failures += 1
-            if self._connection is not None:
-                try:
-                    await self._connection.close()
-                except Exception:
-                    failures += 1
-            self._publisher_channel = None
-            self._exchange = None
-            self._connection = None
-        if failures:
-            raise RabbitMQTransportError("close") from None
+                raise RabbitMQTransportError(operation) from None
+            else:
+                subscription.channel_closed = True
 
 
 __all__ = ["RabbitMQEventTransport", "RabbitMQTransportError"]

@@ -13,8 +13,10 @@
 # limitations under the License.
 """Optional Core plugin that registers and owns the RabbitMQ event transport."""
 
+from collections.abc import Mapping
+
 from orbit import Application
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
 
 from orbit_events_rabbitmq.transport import RabbitMQEventTransport
 
@@ -35,6 +37,14 @@ class RabbitMQTransportPlugin(Plugin):
         if not isinstance(transport, RabbitMQEventTransport):
             raise TypeError("RabbitMQTransportPlugin requires a RabbitMQEventTransport instance.")
         self.transport = transport
+        self.control_actions = (
+            ControlAction(
+                id="check-connection",
+                title="Check RabbitMQ connection",
+                description=("Establish AMQP without publishing or declaring broker topology."),
+                handler=self._check_connection,
+            ),
+        )
 
     def setup(self, application: Application) -> None:
         """Expose the transport under its stable optional-package container key."""
@@ -45,6 +55,11 @@ class RabbitMQTransportPlugin(Plugin):
     async def deactivate(self) -> None:
         """Close the AMQP connection on normal shutdown or partial-startup rollback."""
         await self.transport.close()
+
+    async def _check_connection(self, _: Mapping[str, object]) -> ControlResult:
+        """Establish the AMQP connection and retain it for plugin-owned shutdown."""
+        await self.transport.check_connection()
+        return ControlResult("RabbitMQ connection is established.")
 
 
 __all__ = ["RABBITMQ_EVENT_TRANSPORT_KEY", "RabbitMQTransportPlugin"]

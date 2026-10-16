@@ -218,7 +218,7 @@ async def test_publish_uses_durable_topic_exchange_and_confirmed_persistent_mess
     assert routing_key == "orders.created"
     assert mandatory is True
     assert isinstance(published, FakeMessage)
-    assert published.options["content_type"] == "application/json"
+    assert published.options["content_type"] == "application/cloudevents+json"
     await transport.close()
     assert publisher.closed and connection.closed
     with pytest.raises(RabbitMQTransportError):
@@ -308,6 +308,24 @@ async def test_core_plugin_registers_and_closes_transport() -> None:
 
 
 @pytest.mark.asyncio
+async def test_plugin_connection_action_establishes_connection_without_topology_changes() -> None:
+    """The CLI check opens AMQP but does not create a channel or broker topology."""
+    connection, connect, make_message = factories()
+    plugin = RabbitMQTransportPlugin(
+        RabbitMQEventTransport(
+            make_config(), connection_factory=connect, message_factory=make_message
+        )
+    )
+
+    result = await plugin.control_actions[0].handler({})
+
+    assert result is not None and result.summary == "RabbitMQ connection is established."
+    assert not connection.channels
+    await plugin.deactivate()
+    assert connection.closed
+
+
+@pytest.mark.asyncio
 async def test_cancelled_close_waits_for_shared_cleanup_and_can_be_retried() -> None:
     """Cancellation cannot strand AMQP resources or duplicate concurrent shutdown."""
     connection, connect, make_message = factories()
@@ -341,4 +359,62 @@ async def test_cancelled_close_waits_for_shared_cleanup_and_can_be_retried() -> 
     await waiter
     await transport.close()
     assert close_calls == 1
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+async def test_failed_subscription_and_connection_close_are_retried() -> None:
+    """Shutdown retains each failed resource and retries only cleanup still outstanding."""
+    connection, connect, make_message = factories()
+    transport = RabbitMQEventTransport(
+        make_config(), connection_factory=connect, message_factory=make_message
+    )
+    await transport.publish(Event(name="orders.created", payload={"order_id": "o-4"}))
+
+    async def handler(_event: Event[object]) -> None:
+        return None
+
+    await transport.subscribe("orders.updated", handler)
+    consumer_channel = connection.channels[1]
+    cancel_calls = 0
+    channel_close_calls = 0
+    connection_close_calls = 0
+
+    async def cancel_once(consumer_tag: str) -> object:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        if cancel_calls == 1:
+            raise RuntimeError("temporary consumer cancellation failure")
+        connection.queue.cancelled = True
+        return object()
+
+    async def close_channel_once() -> None:
+        nonlocal channel_close_calls
+        channel_close_calls += 1
+        if channel_close_calls == 1:
+            raise RuntimeError("temporary channel close failure")
+        consumer_channel.closed = True
+
+    async def close_connection_once() -> None:
+        nonlocal connection_close_calls
+        connection_close_calls += 1
+        if connection_close_calls == 1:
+            raise RuntimeError("temporary connection close failure")
+        connection.closed = True
+
+    connection.queue.cancel = cancel_once  # type: ignore[method-assign]
+    consumer_channel.close = close_channel_once  # type: ignore[method-assign]
+    connection.close = close_connection_once  # type: ignore[method-assign]
+
+    with pytest.raises(RabbitMQTransportError, match="close"):
+        await transport.close()
+    assert not consumer_channel.closed
+    assert not connection.closed
+
+    await transport.close()
+    await transport.close()
+    assert cancel_calls == 2
+    assert channel_close_calls == 2
+    assert connection_close_calls == 2
+    assert consumer_channel.closed
     assert connection.closed

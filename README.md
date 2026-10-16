@@ -30,9 +30,12 @@ await transport.publish(order_created_event)
 
 The plugin registers the adapter under `RABBITMQ_EVENT_TRANSPORT_KEY` and closes its robust
 connection during Core shutdown. Concurrent shutdown callers share one cleanup, and cancellation is
-propagated only after owned channels and the connection have been closed. Exchange and queue
+propagated only after owned channels and the connection have been closed. Orbit CLI adds a
+read-only **Check RabbitMQ connection** action that opens AMQP without publishing or declaring
+topology; the plugin owns closing that connection. Exchange and queue
 declarations are durable by default. Publishing
-uses persistent JSON event messages, mandatory routing, and aio-pika publisher confirms.
+uses persistent CloudEvents 1.0 structured JSON messages, mandatory routing, and aio-pika publisher
+confirms.
 
 ## Delivery behavior and limits
 
@@ -64,7 +67,7 @@ ruff check .
 mypy
 ```
 
-This package is pre-alpha, its API is not stable, and it supports Python 3.11 through 3.14.
+This package is alpha, its API is not stable, and it supports Python 3.11 through 3.14.
 
 The transport follows aio-pika's documented [publisher confirms](https://docs.aio-pika.com/rabbitmq-tutorial/7-publisher-confirms.html)
 and [manual acknowledgement](https://docs.aio-pika.com/rabbitmq-tutorial/2-work-queues.html) behavior.

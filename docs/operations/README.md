@@ -41,10 +41,13 @@ await transport.publish(order_created_event)
 ```
 
 The plugin registers the adapter under `RABBITMQ_EVENT_TRANSPORT_KEY` and closes its robust
-connection during Core shutdown. Concurrent shutdown callers share one cleanup, and cancellation is
-propagated only after owned channels and the connection have been closed. Exchange and queue
-declarations are durable by default. Publishing
-uses persistent JSON event messages, mandatory routing, and aio-pika publisher confirms.
+connection during Core shutdown. Concurrent shutdown callers share one cleanup. A cancelled caller
+waits for the shared cleanup to settle before its cancellation is re-raised. Successfully closed
+resources are released independently; failed or interrupted resources remain owned so a later
+`close()` can retry them. The transport stays unavailable after shutdown begins. Exchange and queue
+declarations are durable by default. Publishing uses persistent CloudEvents 1.0 structured JSON
+messages, mandatory
+routing, and aio-pika publisher confirms.
 
 ## Delivery behavior and limits
 
